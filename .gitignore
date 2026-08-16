@@ -1,0 +1,21 @@
+# ==== 凭证:绝对不能提交 ====
+# service account 私钥一旦推到公开仓库,等同于把 Google Cloud 项目的访问权交出去。
+# 本项目自身不需要任何 json 文件,因此直接全部忽略,避免漏网。
+*.json
+rclone.conf
+
+# ==== 内部工作记录,不随仓库发布 ====
+AGENTS.md
+
+# ==== 运行产物 ====
+logs/
+v2x-data/
+*.log
+
+# ==== 编辑器 / 工具配置 ====
+.claude/
+.vscode/
+.idea/
+
+# ==== macOS ====
+.DS_Store
