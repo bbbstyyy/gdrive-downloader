@@ -6,10 +6,14 @@ rclone.conf
 
 # ==== 内部工作记录,不随仓库发布 ====
 AGENTS.md
+.workbuddy/
 
 # ==== 运行产物 ====
-logs/
+# 主脚本默认输出目录
+downloads/
+# examples/download_v2x.sh 的默认输出目录
 v2x-data/
+logs/
 *.log
 
 # ==== 编辑器 / 工具配置 ====
