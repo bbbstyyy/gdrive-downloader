@@ -11,8 +11,6 @@ AGENTS.md
 # ==== 运行产物 ====
 # 主脚本默认输出目录
 downloads/
-# examples/download_v2x.sh 的默认输出目录
-v2x-data/
 logs/
 *.log
 

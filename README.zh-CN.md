@@ -8,9 +8,7 @@
 
 支持断点续传、对限流友好的 Google Drive 下载工具 —— **任意 Drive 链接**都能下：整个文件夹、单个文件、在线文档，并可选择走网络代理。
 
-> **仓库已由 `v2x-downloader` 改名。** GitHub 会自动重定向旧地址，但已克隆的本地仓库需要更新远端：`git remote set-url origin <新地址>`。V2X 预置脚本从 `./download_v2x.sh` 移到了 [`./examples/download_v2x.sh`](examples/download_v2x.sh)。
-
-这个项目最早是为了从 Google Drive 拉 141 GiB 的 V2X 自动驾驶公开数据集（DAIR-V2X 与 V2X-Seq），主要跟两件事作斗争：传输中断和限流。这部分能力仍然在，并且仍是文件夹链接的默认路径；只是在它之上做了通用化，现在一个裸文件链接、一个 Docs/Sheets/Slides 链接同样能处理。
+大文件传输失败通常就两个原因：连接中断，以及 Google 对发起请求的身份做限流。这个脚本针对的就是这两点 —— 用续传代替重来，用预先限速代替撞上 403 再补救；至于下的是什么内容，它并不关心：文件夹链接、`/file/d/<ID>` 单文件链接、Docs/Sheets/Slides 链接，同一条命令都能处理。
 
 ## 特性
 
@@ -20,13 +18,14 @@
 - **完整性校验** —— 与远端比对 MD5，并为静默损坏的文件提供单独的修复路径
 - **代理支持** —— `--proxy`（或 `PROXY` 环境变量）同时作用于 rclone 与 curl 两条路径
 - **单文件无需凭证** —— 公开的单文件链接走直链下载；只有文件夹链接才必须用 rclone
-- **按需下载** —— 可只取某一个子数据集，不必下满 141 GiB
+- **自动发现凭证** —— 当前目录里放着 service account 密钥即可，不需要任何参数
+- **按需下载** —— 用 `--include` 只取需要的路径
 - **无头运行** —— 用 service account 认证，服务器上不需要浏览器
 - **不侵入配置** —— 通过环境变量配置 rclone，绝不改动你的 `rclone.conf`
 
 ### 为什么不用 gdown
 
-下 Google Drive 通常首选 `gdown`，但它扛不住大体量：大文件传输容易中断，而为恢复中断所做的多次重试，恰恰会触发 Google 的限流。`rclone` 原生支持续传，并且可以预先限制请求频率 —— 是绕开这个失败模式，而不是事后补救。
+下 Google Drive 通常首选 `gdown`，但它扛不住大体量：大文件传输容易中断，而为恢复中断所做的多次重试，恰恰会触发 Google 的限流。`rclone` 原生支持续传，并且可以预先限制请求频率 —— 是绕开这个失败模式，而不是事后补救。当然，单个小文件没必要这么做，脚本会对它直接走直链。
 
 ## 各类链接的处理方式
 
@@ -43,8 +42,8 @@
 | 路径 | 说明 |
 |---|---|
 | `gdrive-download.sh` | 下载器本体。真正需要的只有这一个文件。 |
-| `examples/download_v2x.sh` | V2X 数据集文件夹的预置包装 —— 可复制一份作为你自己文件夹的模板 |
 | `README.md` · `README.zh-CN.md` | 文档：英文 / 简体中文 |
+| `LICENSE` | MIT |
 
 ## 环境要求
 
@@ -66,6 +65,16 @@ Ubuntu apt 源里的 rclone 版本通常偏旧，建议用官方安装脚本。
 
 文件夹链接（以及需要凭证的单文件路径）只要求「任意一个通过认证的 Google 身份」，不需要文件夹所有者额外授权 —— 只要链接的共享设置是「知道链接的任何人可查看」。服务器上没有浏览器，用 service account 最省事。
 
+### 凭证从哪里加载
+
+按下面的顺序查找：
+
+1. **`--sa FILE` 或环境变量 `SA_FILE`** —— 按给定的路径使用，找不到就到此为止：文件夹链接直接报错，单文件则回退到直链。
+2. **当前目录下的 `./service-account.json`** —— 默认位置。
+3. **当前目录下其它 service account 密钥** —— 默认文件名不存在时，脚本会扫一遍当前目录的 `*.json`，凡是内容里同时有 `"type": "service_account"` 与 `"private_key"` 的即视为密钥；只有恰好命中一个时才自动采用。命中多个则不猜，直接列出候选并提示你用 `--sa` 指定。
+
+所以把密钥丢进你执行脚本的目录就够了，不必非叫 `service-account.json`。自动发现不会覆盖显式的 `--sa` / `SA_FILE`；指定了 `--remote <名字>` 时更是完全不加载 service account，控制权始终在你手里。
+
 ### 方式 A：service account（推荐）
 
 在任意一个你自己的 Google Cloud 项目里操作，全程只需一次：
@@ -74,11 +83,19 @@ Ubuntu apt 源里的 rclone 版本通常偏旧，建议用官方安装脚本。
 2. 启用 **Google Drive API**：https://console.cloud.google.com/apis/library/drive.googleapis.com
 3. **IAM 和管理 → 服务账号 → 创建服务账号**，填个名字后一路点下去 —— **授予角色那一步留空**
 4. 点进该服务账号 → **密钥 → 添加密钥 → 创建新密钥 → JSON** → 下载
-5. 传到服务器：
+5. 把密钥放到脚本会自动查找的位置 —— 最省事的就是你执行脚本的那个目录：
 
 ```bash
-scp service-account.json user@server:/etc/v2x/sa.json
-ssh user@server 'chmod 600 /etc/v2x/sa.json'
+mv ~/Downloads/service-account.json ./service-account.json
+chmod 600 ./service-account.json
+```
+
+如果更愿意放在项目外的固定位置，也可以放过去再用 `--sa` 指过去（或导出 `SA_FILE`）：
+
+```bash
+scp service-account.json user@server:/etc/gdrive/sa.json
+ssh user@server 'chmod 600 /etc/gdrive/sa.json'
+# 之后：./gdrive-download.sh download '<链接>' --sa /etc/gdrive/sa.json
 ```
 
 角色留空是对的。IAM 角色管的是 Google Cloud 自家资源的访问权，而这里只是借这个身份通过认证，好去读一个公开共享的文件夹。它不消耗你的 Drive 配额。
@@ -110,11 +127,13 @@ chmod +x gdrive-download.sh
 所有参数都既可用命令行选项、也可用环境变量给出；`./gdrive-download.sh -h` 可查看完整列表。
 
 ```bash
-# 文件夹链接，下到 /data/v2x，用 service account
-DEST_DIR=/data/v2x SA_FILE=/etc/v2x/sa.json \
-  nohup ./gdrive-download.sh download 'https://drive.google.com/drive/folders/1gnrw5llXAIxuB9sEKKCm6xTaJ5HQAw2e' \
-  > /dev/null 2>&1 &
+# 文件夹链接，下到 /data/gdrive；当前目录里有密钥就自动用
+DEST_DIR=/data/gdrive nohup ./gdrive-download.sh download \
+  'https://drive.google.com/drive/folders/<FOLDER_ID>' > /dev/null 2>&1 &
 tail -f logs/download_*.log
+
+# 文件夹链接，密钥放在别处
+SA_FILE=/etc/gdrive/sa.json ./gdrive-download.sh download '<文件夹链接>'
 
 # 单个公开文件：完全不需要凭证
 ./gdrive-download.sh download 'https://drive.google.com/file/d/<FILE_ID>/view' -d ./data
@@ -156,7 +175,7 @@ PROXY=http://user:pass@10.0.0.1:3128 ./gdrive-download.sh download '<链接>'
 | 文件缺失 | `./gdrive-download.sh download '<链接>'` |
 | 文件存在但内容不一致 | `CHECKSUM=1 ./gdrive-download.sh download '<链接>'` |
 
-第二种情况值得说明：`rclone copy` 按 size + 修改时间判断是否需要重传。如果某个文件内容已损坏、但大小和修改时间仍与远端一致（例如磁盘静默错误），普通 `download` 会认为它已是最新而跳过，而 `verify` 则会一直报不一致。`CHECKSUM=1` 把比对方式切换为 MD5，这些文件才会真正被重新拉取。之所以不设为默认，是因为在这个体量的数据集上重算本地校验和很慢。
+第二种情况值得说明：`rclone copy` 按 size + 修改时间判断是否需要重传。如果某个文件内容已损坏、但大小和修改时间仍与远端一致（例如磁盘静默错误），普通 `download` 会认为它已是最新而跳过，而 `verify` 则会一直报不一致。`CHECKSUM=1` 把比对方式切换为 MD5，这些文件才会真正被重新拉取。之所以不设为默认，是因为在体量较大的下载上重算本地校验和很慢。
 
 **单个文件**或**在线文档导出**的校验则是对比本地大小与远端的 `Content-Length`，并打印本地 MD5 —— 单文件没有便宜的办法拿到远端 MD5（那需要一次 Drive API 调用），所以逐字节的可靠性依赖 `copyid` 路径上 rclone 自身的传输后哈希校验。怀疑某个单文件有问题时，用 `download --overwrite` 重下一次。
 
@@ -170,7 +189,7 @@ PROXY=http://user:pass@10.0.0.1:3128 ./gdrive-download.sh download '<链接>'
 | `--no-proxy` | — | 关 | 忽略环境变量里的 `HTTP_PROXY` / `HTTPS_PROXY` |
 | `-n, --name` | `NAME` | 自动 | 输出文件名（单文件 / 在线文档导出） |
 | `-f, --format` | `FORMAT` | 按文档类型 | 在线文档导出格式：`docx`、`xlsx`、`pptx`、`pdf`、`csv`、`png` |
-| `--sa` | `SA_FILE` | `./service-account.json` | service account 凭证路径 |
+| `--sa` | `SA_FILE` | `./service-account.json`，或自动发现的密钥 | service account 凭证路径；显式给出的值不会被自动发现覆盖 |
 | `--remote` | `RCLONE_REMOTE` | 空 | 改用已有的 rclone remote，设置后忽略 `SA_FILE` |
 | `--type` | `KIND_OVERRIDE` | 自动 | 链接有歧义时强制 `folder` 或 `file` |
 | `--strategy` | `STRATEGY` | `auto` | 单文件下载路径：`auto` / `rclone` / `curl` |
@@ -185,68 +204,17 @@ PROXY=http://user:pass@10.0.0.1:3128 ./gdrive-download.sh download '<链接>'
 ## 只下载部分内容（文件夹链接）
 
 ```bash
-./gdrive-download.sh list '<文件夹链接>'                    # 先看有哪些文件
-./gdrive-download.sh download '<文件夹链接>' --include 'DAIR-V2X (CVPR2022)/**'
+./gdrive-download.sh list '<文件夹链接>'                              # 先看有哪些文件
+./gdrive-download.sh download '<文件夹链接>' --include 'photos/**'
 ```
 
-⚠️ **按文件名过滤时务必带上分卷。** `--include '**/single-vehicle-side-velodyne.zip'` 只会匹配到最后一卷，漏掉 `.z01`~`.z04`，下下来的 zip 根本解不开。正确写法是把整组匹配进来：
+⚠️ **按文件名过滤时务必带上分卷。** 如果远端把某个压缩包拆成 `name.z01`~`name.zNN` 加同名 `name.zip`（`.zip` 是**最后**一卷），那么 `--include '**/name.zip'` 只会匹配到最后一卷，下下来的 zip 根本解不开。正确写法是把整组匹配进来：
 
 ```bash
-./gdrive-download.sh download '<文件夹链接>' --include '**/single-vehicle-side-velodyne.*'
+./gdrive-download.sh download '<文件夹链接>' --include '**/name.*'
 ```
 
-## V2X 数据集（项目起点）
-
-仓库最初就是为这一个文件夹而写的，所以它作为示例保留下来：[`examples/download_v2x.sh`](examples/download_v2x.sh) 只有 27 行，把链接与默认目录固定到数据集上，其余参数全部转发给 `gdrive-download.sh`。
-
-```bash
-./examples/download_v2x.sh check      # 验证凭证，统计文件数与总大小
-./examples/download_v2x.sh list       # 列出远端全部文件
-./examples/download_v2x.sh download    # 下载（默认命令）
-./examples/download_v2x.sh verify      # 与远端比对 MD5
-```
-
-它只是「预置参数」，不是第二份实现 —— 主脚本后来新增的能力（代理、新命令、更合理的默认值）在这里自动生效。想给自己的文件夹做同样的事，复制这份包装、改两个变量即可。
-
-以下内容都是针对这个文件夹的。
-
-### 数据集构成
-
-共 44 个文件，**141.3 GiB**，两个顶层目录：
-
-| 目录 | 内容 |
-|---|---|
-| `DAIR-V2X (CVPR2022)` | DAIR-V2X-C / DAIR-V2X-I / DAIR-V2X-V，各含 Example 与 Full Dataset |
-| `V2X-Seq (CVPR2023)` | Sequential-Perception-Dataset（含 test 集）、Trajectory-Forecasting-Dataset |
-
-单文件最大 8.59 GiB。**大部分数据是分卷压缩包** —— `.z01`~`.z04` 与同名 `.zip` 属于同一份，缺任何一卷都解压不了，详见[解压分卷压缩包](#解压分卷压缩包)。
-
-另有一个 `ReadMe.docx` 是 Google Docs 原生格式，在 `list` 里显示大小为 `-1`，属正常现象，下载时 rclone 会自动导出为标准 `.docx`。
-
-### 解压分卷压缩包
-
-`.z01`~`.z04` 加同名 `.zip`（`.zip` 是**最后**一卷）共同构成一份 WinZip 分卷压缩包。先装工具：
-
-```bash
-sudo apt update && sudo apt install -y zip p7zip-full
-```
-
-**方式一 —— 用 7z 直接处理分卷（推荐）：**
-
-```bash
-7z x single-vehicle-side-velodyne.zip
-```
-
-**方式二 —— 先合并再解压**（所有分卷需在同一目录）：
-
-```bash
-cd "DAIR-V2X (CVPR2022)/DAIR-V2X-V/Full Dataset (train&val)"
-zip -s 0 single-vehicle-side-velodyne.zip --out combined.zip
-unzip combined.zip
-rm combined.zip
-```
-
-方式二的 `zip -s 0` 会生成一个与原始数据等大的合并文件，磁盘需预留约双倍空间；方式一没有这个问题。
+这类分卷包用 `7z x name.zip`（来自 `p7zip-full`）可直接解；也可以先合并再解：`zip -s 0 name.zip --out combined.zip && unzip combined.zip`（合并会生成一份等大的文件，需预留约双倍磁盘空间）。
 
 ## 限流说明
 
@@ -264,7 +232,7 @@ Google Drive 对单个身份有 QPS 和每日流量上限。脚本默认做了�
 
 service account 密钥是长期有效的凭证，拿到它的人可以调用你项目上已启用的 Google Cloud API。
 
-- `.gitignore` 已整体排除 `*.json`，避免密钥被误提交
+- `.gitignore` 已整体排除 `*.json`，避免密钥被误提交 —— 包括自动发现到的那个
 - 保持 `chmod 600`
 - 用完后在 Cloud Console 中吊销
 
@@ -274,7 +242,7 @@ service account 密钥是长期有效的凭证，拿到它的人可以调用你�
 
 本仓库**只提供下载工具**，不托管、不镜像、不再分发任何数据。
 
-数据集是其原作者的成果 —— DAIR-V2X（CVPR 2022）与 V2X-Seq（CVPR 2023）。其许可条款、允许的用途和引用要求由原作者规定，与本项目无关。使用数据前请查阅 Drive 文件夹内的 `ReadMe.docx` 及相应论文，并在成果中按要求引用。你把脚本指向的任何其它链接，同样如此。
+你让脚本去取的任何内容，版权与使用条款都由其发布方规定，与本项目无关。使用前请自行确认相关条款。
 
 ## 许可证
 

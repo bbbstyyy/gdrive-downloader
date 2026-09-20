@@ -8,9 +8,7 @@
 
 A resumable, rate-limit-aware downloader for **any Google Drive link** — a whole folder, a single file, or a Google Doc — including optional routing through a network proxy.
 
-> **Renamed from `v2x-downloader`.** GitHub redirects the old repository URL automatically, but an existing local clone needs its remote updated: `git remote set-url origin <new-url>`. The V2X preset wrapper moved from `./download_v2x.sh` to [`./examples/download_v2x.sh`](examples/download_v2x.sh).
-
-The project started as a way to pull the 141 GiB public V2X autonomous-driving datasets (DAIR-V2X and V2X-Seq) off Google Drive, where the fight is against interrupted transfers and rate limits. That capability is still here and still the default path for folder links; it has just been generalized, so the same script now also handles a bare file link or a Docs/Sheets/Slides URL.
+Large Drive transfers fail for two reasons: the connection drops, and Google rate-limits the identity doing the fetching. This script is built around both — resume instead of restart, cap the request rate instead of reacting to a 403 — and it does not care what you are downloading: a folder link, a `/file/d/<ID>` link and a Docs/Sheets/Slides URL are all handled by the same command.
 
 ## Features
 
@@ -20,7 +18,8 @@ The project started as a way to pull the 141 GiB public V2X autonomous-driving d
 - **Verified** — MD5 comparison against the remote, with a distinct repair path for silently corrupted files
 - **Proxy-aware** — `--proxy` (or the `PROXY` env var) routes both the rclone and curl paths
 - **No credentials needed for single files** — a public file link is fetched over a direct URL; rclone is only required for folder links
-- **Selective** — fetch a single sub-dataset instead of all 141 GiB
+- **Finds its own credentials** — a service account key sitting in the working directory is picked up with no flags
+- **Selective** — `--include` fetches just the paths you want
 - **Headless** — service account auth, no browser required on the server
 - **Non-invasive** — configures rclone via environment variables; never writes to your `rclone.conf`
 
@@ -43,8 +42,8 @@ The project started as a way to pull the 141 GiB public V2X autonomous-driving d
 | Path | What it is |
 |---|---|
 | `gdrive-download.sh` | The downloader. This is the only file you actually need. |
-| `examples/download_v2x.sh` | Preset wrapper for the V2X dataset folder — copy it as a template for a folder of your own |
 | `README.md` · `README.zh-CN.md` | Docs, English and 简体中文 |
+| `LICENSE` | MIT |
 
 ## Requirements
 
@@ -66,6 +65,16 @@ The version in Ubuntu's apt repository is usually too old — prefer the officia
 
 Folder links (and the credentialed single-file path) are read using *any* authenticated Google identity — you do not need the folder owner to grant you anything beyond the link being shared as "anyone with the link can view". Since servers have no browser, a service account is the path of least resistance.
 
+### Where the credential is looked up
+
+In this order:
+
+1. **`--sa FILE`, or the `SA_FILE` environment variable** — used exactly as given. Nothing else is tried: if the file is not there, folder links fail and single files fall back to the direct URL.
+2. **`./service-account.json` in the working directory** — the implicit default.
+3. **Any other service account key in the working directory** — when the default filename is absent, the script scans the working directory for `*.json` files that look like a service account key (they contain `"type": "service_account"` and a `"private_key"`) and uses it if exactly one matches. If several match, nothing is chosen automatically — you get the candidate list and a request to pass `--sa`.
+
+So dropping the key in the directory you run from is enough; it does not have to be called `service-account.json`. Auto-discovery never overrides an explicit `--sa` / `SA_FILE`, and it is not consulted at all when you pass `--remote <name>`, so you stay in full control.
+
 ### Option A — service account (recommended)
 
 One-time setup in any Google Cloud project of your own:
@@ -74,11 +83,19 @@ One-time setup in any Google Cloud project of your own:
 2. Enable the **Google Drive API**: https://console.cloud.google.com/apis/library/drive.googleapis.com
 3. **IAM & Admin → Service Accounts → Create service account**. Give it a name and click through — **leave the roles section empty**
 4. Open the service account → **Keys → Add key → Create new key → JSON** → download
-5. Copy it to the server:
+5. Put the key where the script will look for it — the simplest is the directory you run the script from:
 
 ```bash
-scp service-account.json user@server:/etc/v2x/sa.json
-ssh user@server 'chmod 600 /etc/v2x/sa.json'
+mv ~/Downloads/service-account.json ./service-account.json
+chmod 600 ./service-account.json
+```
+
+If you prefer a fixed location outside the project, keep it there and either point `--sa` at it or export `SA_FILE`:
+
+```bash
+scp service-account.json user@server:/etc/gdrive/sa.json
+ssh user@server 'chmod 600 /etc/gdrive/sa.json'
+# then: ./gdrive-download.sh download '<link>' --sa /etc/gdrive/sa.json
 ```
 
 Leaving the roles empty is correct. IAM roles govern access to Google Cloud resources; here the account is only used to authenticate as *some* Google identity so it can read a publicly shared folder. It consumes none of your Drive quota.
@@ -110,11 +127,13 @@ chmod +x gdrive-download.sh
 Everything is also settable as an option or an environment variable; `./gdrive-download.sh -h` prints the full list.
 
 ```bash
-# folder link, into /data/v2x, with a service account
-DEST_DIR=/data/v2x SA_FILE=/etc/v2x/sa.json \
-  nohup ./gdrive-download.sh download 'https://drive.google.com/drive/folders/1gnrw5llXAIxuB9sEKKCm6xTaJ5HQAw2e' \
-  > /dev/null 2>&1 &
+# folder link, into /data/gdrive; the key is taken from the working directory if present
+DEST_DIR=/data/gdrive nohup ./gdrive-download.sh download \
+  'https://drive.google.com/drive/folders/<FOLDER_ID>' > /dev/null 2>&1 &
 tail -f logs/download_*.log
+
+# folder link with the key stored somewhere else
+SA_FILE=/etc/gdrive/sa.json ./gdrive-download.sh download '<folder link>'
 
 # a single public file — no credentials involved
 ./gdrive-download.sh download 'https://drive.google.com/file/d/<FILE_ID>/view' -d ./data
@@ -156,7 +175,7 @@ For a **folder**, MD5 hashes are compared against the remote and differences are
 | File missing | `./gdrive-download.sh download '<link>'` |
 | File present but content differs | `CHECKSUM=1 ./gdrive-download.sh download '<link>'` |
 
-The second case is worth understanding. `rclone copy` decides whether to re-transfer based on size + modification time. If a file's contents are corrupted but its size and mtime still match the remote — silent disk corruption, for instance — a plain `download` considers it up to date and skips it, while `verify` keeps reporting a mismatch. `CHECKSUM=1` switches the comparison to MD5 so those files are actually re-fetched. It is not the default because rehashing local files is slow on a dataset this size.
+The second case is worth understanding. `rclone copy` decides whether to re-transfer based on size + modification time. If a file's contents are corrupted but its size and mtime still match the remote — silent disk corruption, for instance — a plain `download` considers it up to date and skips it, while `verify` keeps reporting a mismatch. `CHECKSUM=1` switches the comparison to MD5 so those files are actually re-fetched. It is not the default because rehashing local files is slow on a large transfer.
 
 For a **single file** or a **Doc export**, `verify` compares the local size against the remote `Content-Length` and prints the local MD5 — there is no cheap way to obtain a remote MD5 for one file without a Drive API call, so byte-exact verification of a single file rests on rclone's own post-transfer hash check on the `copyid` path. Re-running `download --overwrite` is the way to repair a suspect single file.
 
@@ -170,7 +189,7 @@ For a **single file** or a **Doc export**, `verify` compares the local size agai
 | `--no-proxy` | — | off | Ignore `HTTP_PROXY` / `HTTPS_PROXY` from the environment |
 | `-n, --name` | `NAME` | *derived* | Output filename (single file / Doc export) |
 | `-f, --format` | `FORMAT` | by doc type | Export format for Google Docs: `docx`, `xlsx`, `pptx`, `pdf`, `csv`, `png` |
-| `--sa` | `SA_FILE` | `./service-account.json` | Path to the service account key |
+| `--sa` | `SA_FILE` | `./service-account.json`, or an auto-detected key | Path to the service account key; an explicit value is never overridden by auto-discovery |
 | `--remote` | `RCLONE_REMOTE` | *empty* | Use an existing rclone remote instead; overrides `SA_FILE` |
 | `--type` | `KIND_OVERRIDE` | *auto* | Force `folder` or `file` when the link is ambiguous |
 | `--strategy` | `STRATEGY` | `auto` | Single-file path: `auto`, `rclone`, or `curl` |
@@ -185,68 +204,17 @@ For a **single file** or a **Doc export**, `verify` compares the local size agai
 ## Downloading a subset (folder links)
 
 ```bash
-./gdrive-download.sh list '<folder link>'                   # see what's there
-./gdrive-download.sh download '<folder link>' --include 'DAIR-V2X (CVPR2022)/**'
+./gdrive-download.sh list '<folder link>'                        # see what's there
+./gdrive-download.sh download '<folder link>' --include 'photos/**'
 ```
 
-⚠️ **When filtering by filename, include the split parts.** `--include '**/single-vehicle-side-velodyne.zip'` matches only the last part and leaves out `.z01`–`.z04`, producing a `.zip` that cannot be extracted. Match the whole group instead:
+⚠️ **When filtering by filename, include the split parts.** If the remote ships an archive as `name.z01`–`name.zNN` plus `name.zip` (the `.zip` is the *last* part), then `--include '**/name.zip'` matches only that final part and produces a `.zip` that cannot be extracted. Match the whole group instead:
 
 ```bash
-./gdrive-download.sh download '<folder link>' --include '**/single-vehicle-side-velodyne.*'
+./gdrive-download.sh download '<folder link>' --include '**/name.*'
 ```
 
-## The V2X datasets (why this exists)
-
-The repository originally existed for this one folder, so it ships as a worked example: [`examples/download_v2x.sh`](examples/download_v2x.sh) is a 27-line wrapper that pins the link and the default destination to the dataset, and forwards everything else to `gdrive-download.sh`.
-
-```bash
-./examples/download_v2x.sh check      # verify credentials, count files and total size
-./examples/download_v2x.sh list       # list every remote file
-./examples/download_v2x.sh download    # download (default command)
-./examples/download_v2x.sh verify      # MD5-verify local against remote
-```
-
-Because it is just a preset, and not a second implementation, everything the main script learns (proxy support, new commands, better defaults) applies here too. To do the same for a folder of your own, copy the wrapper and change two variables.
-
-Everything below applies to that folder.
-
-### Contents
-
-44 files, **141.3 GiB** total, in two top-level directories:
-
-| Directory | Contents |
-|---|---|
-| `DAIR-V2X (CVPR2022)` | DAIR-V2X-C / DAIR-V2X-I / DAIR-V2X-V, each with an Example and a Full Dataset |
-| `V2X-Seq (CVPR2023)` | Sequential-Perception-Dataset (incl. test split), Trajectory-Forecasting-Dataset |
-
-Largest single file is 8.59 GiB. **Most of the data ships as split archives** — `.z01`–`.z04` plus a same-named `.zip` form one archive, and you need every part to extract it. See [Extracting split archives](#extracting-split-archives).
-
-One file, `ReadMe.docx`, is a native Google Docs document. It shows a size of `-1` in `list` — that's expected, and rclone exports it to a standard `.docx` on download.
-
-### Extracting split archives
-
-`.z01`–`.z04` plus the same-named `.zip` (which is the *last* part) form one WinZip split archive. Install the tools first:
-
-```bash
-sudo apt update && sudo apt install -y zip p7zip-full
-```
-
-**Option 1 — 7z, handles the parts directly (preferred):**
-
-```bash
-7z x single-vehicle-side-velodyne.zip
-```
-
-**Option 2 — merge, then extract** (all parts must be in the same directory):
-
-```bash
-cd "DAIR-V2X (CVPR2022)/DAIR-V2X-V/Full Dataset (train&val)"
-zip -s 0 single-vehicle-side-velodyne.zip --out combined.zip
-unzip combined.zip
-rm combined.zip
-```
-
-Option 2's `zip -s 0` writes a merged copy as large as the original data, so it needs roughly double the disk space. Option 1 avoids that.
+Such split archives extract with `7z x name.zip` (from `p7zip-full`), or by merging first with `zip -s 0 name.zip --out combined.zip && unzip combined.zip` — the merge needs roughly double the disk space.
 
 ## Rate limits
 
@@ -264,7 +232,7 @@ A **per-file** download quota also exists and is independent of your account —
 
 The service account key is a long-lived credential. Anyone holding it can call the Google Cloud APIs enabled on your project.
 
-- `.gitignore` excludes `*.json` wholesale so a key can't be committed by accident
+- `.gitignore` excludes `*.json` wholesale so a key can't be committed by accident — including one auto-detected in the working directory
 - Keep it at `chmod 600`
 - Revoke it from the Cloud Console when you're done
 
@@ -274,7 +242,7 @@ Proxy URLs may contain credentials; pass them via `--proxy` or `PROXY` and avoid
 
 This repository contains **only a download tool**. It does not host, mirror, or redistribute any data.
 
-The datasets are the work of their original authors — DAIR-V2X (CVPR 2022) and V2X-Seq (CVPR 2023). Their licensing terms, permitted uses, and citation requirements are set by those authors, not by this project. Consult the `ReadMe.docx` included in the Drive folder and the corresponding papers before using the data, and cite them in any resulting work. The same applies to any other link you point this script at.
+Whatever you point the script at stays the work of whoever published it; its licence, permitted uses and citation requirements are set by them, not by this project. Check those terms before using the data.
 
 ## License
 

@@ -27,10 +27,16 @@ PROG="$(basename "$0")"
 # ---------------------------------------------------------------- 默认配置
 LINK_INPUT="${LINK:-${URL:-${GDRIVE_URL:-}}}"
 [[ -z "$LINK_INPUT" && -n "${FOLDER_ID:-}" ]] && LINK_INPUT="${FOLDER_ID}"
-DEFAULT_LINK="${DEFAULT_LINK:-}"     # 调用方(如 examples/download_v2x.sh)预置的默认链接,优先级低于命令行参数
+DEFAULT_LINK="${DEFAULT_LINK:-}"     # 调用方可预置的默认链接(如自己的包装脚本),优先级低于命令行参数
 
 DEST_DIR="${DEST_DIR:-./downloads}"
+
+# 凭证查找顺序: --sa / 环境变量 SA_FILE(显式) > 当前目录下的 ./service-account.json
+#               > 当前目录下唯一一个 service account 密钥(自动发现,见 resolve_sa_file)
+SA_FILE_EXPLICIT=0
+if [[ -n "${SA_FILE:-}" ]]; then SA_FILE_EXPLICIT=1; fi
 SA_FILE="${SA_FILE:-./service-account.json}"
+
 LOG_DIR="${LOG_DIR:-./logs}"
 
 # 并发与限流: Drive 对单账号有 QPS 上限,调高 TRANSFERS 反而更容易触发 403 rateLimitExceeded
@@ -39,8 +45,8 @@ CHECKERS="${CHECKERS:-8}"
 TPSLIMIT="${TPSLIMIT:-8}"
 BWLIMIT="${BWLIMIT:-off}"
 
-# 只下载部分子目录时设置,例如 INCLUDE='DAIR-V2X (CVPR2022)/**'
-# 注意:数据集大量使用分卷压缩(.z01-.z04 与 .zip 同属一份),过滤时必须把同名分卷全部包含,否则解压不了
+# 只下载部分子目录时设置,例如 INCLUDE='photos/**'
+# 注意:若目标里的压缩包是分卷的(.z01~.zNN 与同名的 .zip 同属一份),过滤时必须把同名分卷全部包含,否则解压不了
 INCLUDE="${INCLUDE:-}"
 
 # 1=按 MD5 比对而非 size+modtime。修复"大小相同但内容已损坏"的文件时必须开启,代价是要重算本地校验和
@@ -134,6 +140,12 @@ $PROG —— 从任意 Google Drive 链接下载内容
   verify    校验本地与远端是否一致
   info      只解析链接,打印类型/ID/直链,不下载(不需要凭证)
 
+凭证:
+  文件夹链接(以及 rclone 单文件路径)需要一个 service account 密钥(*.json)。
+  查找顺序: --sa / SA_FILE 指定的路径  ->  当前目录下的 ./service-account.json
+            ->  当前目录下唯一一个 service account 密钥(存在即自动加载,不必改文件名)
+  公开的单文件链接完全不需要凭证,会直接走 curl 直链。
+
 选项:
   -p, --proxy URL    网络代理,如 http://127.0.0.1:7890 / socks5h://127.0.0.1:1080
                      也可用环境变量 PROXY。文件夹模式走 rclone,仅支持 http/https 代理
@@ -141,9 +153,10 @@ $PROG —— 从任意 Google Drive 链接下载内容
   -d, --dest DIR     本地保存目录          (默认: $DEST_DIR)
   -n, --name NAME    单文件/在线文档的输出文件名
   -f, --format FMT   在线文档导出格式: docx|xlsx|pptx|pdf|csv|png (默认按文档类型)
-      --sa FILE      service account 凭证  (默认: $SA_FILE)
+      --sa FILE      service account 凭证路径
+                     (默认: $SA_FILE,不存在时自动加载当前目录下唯一的密钥)
       --remote NAME  复用已有的 rclone remote,设置后忽略 --sa
-      --include GLOB 只下载匹配的路径,如 'DAIR-V2X (CVPR2022)/**'
+      --include GLOB 只下载匹配的路径,如 'photos/**'
       --type T       链接类型有歧义时指定: folder | file
       --strategy S   单文件下载路径: auto | rclone | curl  (默认 auto)
       --threads N    并发文件数             (默认: $TRANSFERS)
@@ -155,7 +168,7 @@ $PROG —— 从任意 Google Drive 链接下载内容
   -h, --help         显示本帮助
 
 示例:
-  $PROG download 'https://drive.google.com/drive/folders/1gnrw5llXAIxuB9sEKKCm6xTaJ5HQAw2e'
+  $PROG download 'https://drive.google.com/drive/folders/<FOLDER_ID>'
   $PROG download 'https://drive.google.com/file/d/<FILE_ID>/view' -d ./data
   $PROG download 'https://docs.google.com/document/d/<DOC_ID>/edit' -n readme.docx
   PROXY=http://127.0.0.1:7890 $PROG download <链接>
@@ -177,8 +190,8 @@ parse_args() {
       --name=*)      NAME="${1#*=}"; shift ;;
       -f|--format)   [[ $# -ge 2 ]] || die "--format 缺少参数"; FORMAT="$2"; shift 2 ;;
       --format=*)    FORMAT="${1#*=}"; shift ;;
-      --sa)          [[ $# -ge 2 ]] || die "--sa 缺少参数"; SA_FILE="$2"; shift 2 ;;
-      --sa=*)        SA_FILE="${1#*=}"; shift ;;
+      --sa)          [[ $# -ge 2 ]] || die "--sa 缺少参数"; SA_FILE="$2"; SA_FILE_EXPLICIT=1; shift 2 ;;
+      --sa=*)        SA_FILE="${1#*=}"; SA_FILE_EXPLICIT=1; shift ;;
       --remote)      [[ $# -ge 2 ]] || die "--remote 缺少参数"; RCLONE_REMOTE="$2"; shift 2 ;;
       --remote=*)    RCLONE_REMOTE="${1#*=}"; shift ;;
       --include)     [[ $# -ge 2 ]] || die "--include 缺少参数"; INCLUDE="$2"; shift 2 ;;
@@ -211,7 +224,7 @@ parse_args() {
     esac
   done
 
-  # 未显式给链接时,退回调用方预置的默认链接(例如 examples/download_v2x.sh 里的数据集文件夹)
+  # 未显式给链接时,退回调用方预置的默认链接(环境变量 DEFAULT_LINK,见脚本头部配置)
   if [[ "$POSITIONAL_SEEN" == "0" && -z "$LINK_INPUT" && -n "${DEFAULT_LINK:-}" ]]; then
     LINK_INPUT="$DEFAULT_LINK"
   fi
@@ -317,6 +330,58 @@ resolve_link_kind() {
   return 0
 }
 
+# ---------------------------------------------------------------- 凭证
+# 看起来像 service account 密钥的 json(而不是普通的配置文件)
+sa_looks_like_key() {
+  [[ -f "$1" ]] || return 1
+  grep -q '"type"[[:space:]]*:[[:space:]]*"service_account"' "$1" 2>/dev/null || return 1
+  grep -q '"private_key"' "$1" 2>/dev/null || return 1
+  return 0
+}
+
+# 解析出可用的凭证文件并写回 SA_FILE;没有可用凭证时返回 1
+# 顺序: 显式指定(--sa / SA_FILE) > 当前目录的 ./service-account.json > 当前目录里唯一一个 sa 密钥
+SA_RESOLVED=0
+resolve_sa_file() {
+  if [[ "$SA_RESOLVED" == "1" ]]; then
+    if [[ -f "$SA_FILE" ]]; then return 0; else return 1; fi
+  fi
+  SA_RESOLVED=1
+
+  if [[ -f "$SA_FILE" ]]; then
+    [[ "$SA_FILE_EXPLICIT" == "0" ]] && log "凭证: 使用 $SA_FILE"
+    return 0
+  fi
+  # 显式指定的路径不存在时不再猜,交给调用方报错
+  [[ "$SA_FILE_EXPLICIT" == "1" ]] && return 1
+
+  # 默认文件名不存在: 在当前目录下找 service account 密钥,唯一时才自动采用
+  local -a cands=() named=()
+  local f
+  for f in *.json; do
+    sa_looks_like_key "$f" && cands+=("$f")
+  done
+  [[ "${#cands[@]}" -eq 0 ]] && return 1
+
+  if [[ "${#cands[@]}" -eq 1 ]]; then
+    SA_FILE="${cands[0]}"
+  else
+    local g
+    for g in "${cands[@]}"; do
+      case "$g" in *service[-_]account*.json) named+=("$g") ;; esac
+    done
+    if [[ "${#named[@]}" -ne 1 ]]; then
+      warn "当前目录下有多个 service account 密钥,无法自动选择:"
+      printf '  %s\n' "${cands[@]}" >&2
+      warn "请用 --sa <文件> 指定要用哪一个"
+      return 1
+    fi
+    SA_FILE="${named[0]}"
+  fi
+  log "凭证: 自动加载当前目录下的 $SA_FILE"
+  return 0
+}
+
 # ---------------------------------------------------------------- rclone 远端
 # 通过环境变量声明 remote,避免改动用户已有的 ~/.config/rclone/rclone.conf
 # 参数: $1 = 作为根的文件夹 ID(单文件模式留空)
@@ -327,7 +392,7 @@ setup_remote() {
   if [[ -n "$RCLONE_REMOTE" ]]; then
     REMOTE="${RCLONE_REMOTE%:}:"
   else
-    [[ -f "$SA_FILE" ]] || return 1
+    resolve_sa_file || return 1
     REMOTE="gdrivedl:"
     export RCLONE_CONFIG_GDRIVEDL_TYPE="drive"
     export RCLONE_CONFIG_GDRIVEDL_SCOPE="drive.readonly"
@@ -347,8 +412,9 @@ setup_remote() {
 setup_remote_or_die() {
   local root_id="${1:-}"
   setup_remote "$root_id" && return 0
-  die "未找到 service account 凭证: $SA_FILE
-请参考 README.md 创建,或用 --remote <rclone remote 名> 指定已配置好的 remote。
+  die "未找到可用的 service account 凭证(当前目录: $(pwd))
+查找顺序: --sa / SA_FILE 指定的路径  ->  ./service-account.json  ->  当前目录下唯一的 service account 密钥
+请参考 README.md 准备凭证,或用 --remote <rclone remote 名> 指定已配置好的 remote。
 如果这个链接其实是单个文件,加 --type file 即可走 curl 直链(公开链接不需要凭证)。"
 }
 
@@ -413,7 +479,7 @@ cmd_folder_download() {
   echo
 
   # copy 而非 sync: 绝不删除本地已有文件
-  # --multi-thread-*: 单个大文件拆多流下载,对数据集里的大压缩包提速明显
+  # --multi-thread-*: 单个大文件拆多流下载,对别人分享的大压缩包提速明显
   rclone copy "$REMOTE" "$DEST_DIR" \
     "${RC_FLAGS[@]}" \
     --multi-thread-streams 4 \
@@ -654,6 +720,11 @@ cmd_file_download() {
 
   if [[ "$STRATEGY" != "curl" ]]; then
     if setup_remote ""; then
+      # 单文件模式此前没走过 common_flags,而 bash 3.2 下展开空数组会因 set -u 报错,这里补齐公共参数。
+      # --include 对单文件没有意义(上面已警告忽略),临时屏蔽,免得 copyid 反而把目标文件过滤掉
+      local _include="$INCLUDE"; INCLUDE=""
+      common_flags
+      INCLUDE="$_include"
       local dest="$DEST_DIR/"
       [[ -n "$NAME" ]] && dest="$DEST_DIR/$NAME"
       log "策略: rclone backend copyid (服务端 $REMOTE)"
